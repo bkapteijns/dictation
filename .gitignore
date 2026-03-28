@@ -1,0 +1,4 @@
+.dictation.pid
+Dictation.app/
+*.wav
+.DS_Store
