@@ -5,14 +5,35 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_NAME="dictation"
 PIDFILE="$SCRIPT_DIR/.dictation.pid"
 
-# ── 0. Guard against duplicate runs ─────────────────────────────────────────
+# ── 0. Wrapper: Run detached to survive Terminal closing ──────────────
+if [[ "$1" != "--daemon" ]]; then
+    echo "⚙️  Detaching from Terminal to run Dictation silently..."
+
+    nohup bash "$0" --daemon >"$SCRIPT_DIR/dictation.log" 2>&1 &
+    
+    echo "✅ Dictation has been launched in the background."
+    echo "👉 You can safely close this Terminal window. (Logs: $SCRIPT_DIR/dictation.log)"
+    exit 0
+fi
+
+# ── 1. Guard against duplicate runs ─────────────────────────────────────────
 if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
     echo "✅ Dictation is already running (PID $(cat "$PIDFILE")). Exiting."
     exit 0
 fi
 
-cleanup() { rm -f "$PIDFILE"; }
-trap cleanup EXIT
+cleanup() {
+    trap - EXIT INT TERM
+    if [[ -f "$PIDFILE" ]]; then
+        local child_pid=$(cat "$PIDFILE")
+        if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then
+            kill -TERM "$child_pid" 2>/dev/null || true
+        fi
+        rm -f "$PIDFILE"
+    fi
+    exit 0
+}
+trap cleanup EXIT INT TERM
 
 # ── 1. Check / install conda ────────────────────────────────────────────────
 if ! command -v conda &>/dev/null; then
@@ -42,7 +63,16 @@ else
     echo "✅ Environment '$ENV_NAME' created."
 fi
 
-# ── 3. Activate and run ─────────────────────────────────────────────────────
+# ── 3. Load Environment Variables ───────────────────────────────────────────
+if [[ ! -f "$SCRIPT_DIR/.env" ]]; then
+    echo "⚙️  .env file not found. Creating one from .env.template..."
+    cp "$SCRIPT_DIR/.env.template" "$SCRIPT_DIR/.env"
+fi
+set -a
+source "$SCRIPT_DIR/.env"
+set +a
+
+# ── 4. Activate and run ─────────────────────────────────────────────────────
 echo "🚀 Activating '$ENV_NAME' and running main.py..."
 source activate "$ENV_NAME"
 python "$SCRIPT_DIR/main.py" &

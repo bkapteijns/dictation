@@ -2,7 +2,7 @@
 
 APP_NAME="Dictation"
 
-echo "🗑️ Removing '$APP_NAME' from Login Items..."
+echo "🗑️  Removing '$APP_NAME' from Login Items..."
 
 if osascript -e "tell application \"System Events\" to delete (every login item whose name is \"$APP_NAME\")" 2>/dev/null; then
     echo "✅ Successfully removed '$APP_NAME' from Login Items."

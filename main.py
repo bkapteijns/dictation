@@ -10,6 +10,7 @@ import sounddevice as sd
 import soundfile as sf
 from pynput.keyboard import Controller as KeyboardController
 import parakeet_mlx
+import mlx.core as mx
 
 from Quartz import (
     CGEventGetFlags,
@@ -35,6 +36,7 @@ from Quartz import (
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 # ── Hotkey parsing tables ──────────────────────────────────────────────
 
@@ -65,7 +67,6 @@ KEY_NAMES: dict[str, int] = {
     '6': 22, '7': 26, '8': 28, '9': 25,
 }
 
-
 def parse_hotkey(hotkey_str: str) -> tuple[int, int]:
     """Parse a hotkey string like 'option+space' into (modifier_mask, keycode)."""
     modifier_mask: int = 0
@@ -77,6 +78,11 @@ def parse_hotkey(hotkey_str: str) -> tuple[int, int]:
             # pyre-ignore[16]
             modifier_mask = modifier_mask | int(MODIFIER_NAMES[part])
         elif part in KEY_NAMES:
+            if keycode is not None:
+                raise ValueError(
+                    f"Hotkey cannot include multiple primary keys! "
+                    f"Found '{part}' but already parsed another key."
+                )
             keycode = KEY_NAMES[part]
         else:
             raise ValueError(
@@ -109,9 +115,26 @@ class DictationApp:
         self.stream: sd.InputStream | None = None
         self.keyboard = KeyboardController()
 
-        logging.info("Loading Parakeet MLX model (this may take a few seconds)...")
-        self.model = parakeet_mlx.from_pretrained('mlx-community/parakeet-tdt-0.6b-v3')
+        self.transcription_lock = threading.Lock()
+        
+        self.mic_task_queue: queue.Queue = queue.Queue()
+        threading.Thread(target=self._mic_worker, daemon=True).start()
+
+        model_name = os.environ.get("MODEL_NAME", "mlx-community/parakeet-tdt-0.6b-v3")
+        logging.info(f"Loading transcription model '{model_name}' (this may take a few seconds)...")
+        self.model = parakeet_mlx.from_pretrained(model_name)
         logging.info("Model loaded successfully!")
+
+    def _mic_worker(self) -> None:
+        """Background thread executing microphone start/stop safely off the UI thread."""
+        while True:
+            task = self.mic_task_queue.get()
+            try:
+                task()
+            except Exception as e:
+                logging.error(f"Mic worker failed: {e}")
+            finally:
+                self.mic_task_queue.task_done()
 
     # ── Audio ──────────────────────────────────────────────────────────
 
@@ -127,14 +150,25 @@ class DictationApp:
         logging.info("🎙  Recording...")
         self.is_recording = True
 
-        # Drain old data
         while not self.audio_queue.empty():
             self.audio_queue.get()
 
-        self.stream = sd.InputStream(
-            samplerate=self.sample_rate, channels=1, callback=self._audio_callback
-        )
-        self.stream.start()
+        try:
+            self.stream = sd.InputStream(
+                samplerate=self.sample_rate, channels=1, callback=self._audio_callback
+            )
+            self.stream.start()
+        except Exception as e:
+            self.is_recording = False
+            logging.error(f"Failed to start hardware microphone stream: {e}")
+            raise  # Let the worker thread log it normally
+
+    def toggle_recording(self) -> None:
+        """Helper to synchronously toggle state on the mic worker thread."""
+        if self.is_recording:
+            self.stop_recording()
+        else:
+            self.start_recording()
 
     def stop_recording(self) -> None:
         if not self.is_recording:
@@ -156,22 +190,60 @@ class DictationApp:
             return
 
         audio = np.concatenate(chunks)
-        wav_path = os.path.join(tempfile.gettempdir(), "dictation_audio.wav")
-        sf.write(wav_path, audio, self.sample_rate)
-        threading.Thread(target=self._transcribe_and_type, args=(wav_path,), daemon=True).start()
+        
+        # Pad with silence if the audio is exceedingly short
+        min_length = int(self.sample_rate * 0.1)
+        if len(audio) < min_length:
+            padding = np.zeros(min_length - len(audio), dtype=audio.dtype)
+            audio = np.concatenate([audio, padding])
+
+        tmp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        wav_path = tmp_file.name
+        tmp_file.close()
+
+        thread_started = False
+        try:
+            sf.write(wav_path, audio, self.sample_rate)
+            threading.Thread(target=self._transcribe_and_type, args=(wav_path,), daemon=True).start()
+            thread_started = True
+        except Exception as e:
+            logging.error(f"Failed to write audio to file: {e}")
+        finally:
+            if not thread_started and os.path.exists(wav_path):
+                try:
+                    os.remove(wav_path)
+                except Exception as e:
+                    logging.warning(f"Failed to delete temp file {wav_path}: {e}")
 
     # ── Transcription ──────────────────────────────────────────────────
 
     def _transcribe_and_type(self, wav_path: str) -> None:
         logging.info("Transcribing...")
-        try:
-            result = self.model.transcribe(wav_path)
-            text = (result.text if hasattr(result, 'text') else str(result)).strip()
-            logging.info(f"Result: '{text}'")
-            if text:
-                self.keyboard.type(text + ' ')
-        except Exception as e:
-            logging.error(f"Transcription failed: {e}")
+        with self.transcription_lock:
+            try:
+                result = self.model.transcribe(wav_path)
+                text = (result.text if hasattr(result, 'text') else str(result)).strip()
+                logging.info(f"Result: '{text}'")
+                if text:
+                    self.keyboard.type(text + ' ')
+            except Exception as e:
+                logging.error(f"Transcription failed: {e}")
+            finally:
+                if 'result' in locals():
+                    del result
+                if 'text' in locals():
+                    del text
+
+                try:
+                    mx.clear_cache()
+                except Exception as e:
+                    logging.error(f"Failed to clear MLX cache: {e}")
+
+                if os.path.exists(wav_path):
+                    try:
+                        os.remove(wav_path)
+                    except Exception as e:
+                        logging.warning(f"Failed to delete temp file {wav_path}: {e}")
 
     # ── CGEventTap callback ────────────────────────────────────────────
 
@@ -182,33 +254,27 @@ class DictationApp:
 
         keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
         if keycode != self.keycode:
-            return event  # not our key
+            return event
 
-        # On key-up: if we're holding the hotkey, always handle the release
-        # (the user may have released the modifier before the main key)
         if event_type == kCGEventKeyUp and self.hotkey_held:
             self.hotkey_held = False
             if self.mode == 'push-to-talk':
-                self.stop_recording()
-            return None  # suppress
+                self.mic_task_queue.put(self.stop_recording)
+            return None
 
-        # On key-down: require modifiers to be held
         flags = CGEventGetFlags(event)
         if (flags & self.modifier_mask) != self.modifier_mask:
-            return event  # required modifiers not held
+            return event
 
         if event_type == kCGEventKeyDown and not self.hotkey_held:
             self.hotkey_held = True
             if self.mode == 'push-to-talk':
-                self.start_recording()
-            else:  # toggle
-                if self.is_recording:
-                    self.stop_recording()
-                else:
-                    self.start_recording()
-            return None  # suppress
+                self.mic_task_queue.put(self.start_recording)
+            else:
+                self.mic_task_queue.put(self.toggle_recording)
+            return None
 
-        return None  # suppress repeated key-downs while held
+        return None
 
     # ── Run loop ───────────────────────────────────────────────────────
 
@@ -263,8 +329,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    modifier_mask, keycode = parse_hotkey(args.hotkey)
-    logging.info(f"Hotkey: {args.hotkey} (keycode={keycode}, modifier_mask={modifier_mask:#x})")
+    try:
+        modifier_mask, keycode = parse_hotkey(args.hotkey)
+        logging.info(f"Hotkey: {args.hotkey} (keycode={keycode}, modifier_mask={modifier_mask:#x})")
+    except ValueError as e:
+        logging.error(f"Invalid hotkey configuration: {e}")
+        sys.exit(1)
 
     app = DictationApp(modifier_mask, keycode, args.mode)
     app.run()

@@ -13,5 +13,5 @@ if [[ -f "$PIDFILE" ]]; then
         rm -f "$PIDFILE"
     fi
 else
-    echo "ℹ️ No PID file found. Is the app running?"
+    echo "ℹ️  No PID file found. Is the app running?"
 fi

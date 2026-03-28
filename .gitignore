@@ -2,3 +2,6 @@
 Dictation.app/
 *.wav
 .DS_Store
+dictation.log
+__pycache__
+.env

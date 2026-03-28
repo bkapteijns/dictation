@@ -57,11 +57,13 @@ python main.py --mode toggle --hotkey "cmd+shift+d"
 
 ## Uninstallation
 
-To stop the background app, you can either find the Terminal window it opened and press `Ctrl+C`, or run:
+To stop the background app, run:
 
 ```bash
 ./stop.sh
 ```
+
+Alternatively, you can search the process in Activity Monitor and kill it.
 
 To remove the login item and the compiled app, run:
 
