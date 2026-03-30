@@ -49,10 +49,28 @@ A private dictation tool for macOS, as a replacement for Apple's standard dictat
 
 ## Configuration
 
-You can modify the hotkey or mode by editing `run.sh`. For example, to use "toggle" mode:
+You can configure the app using command-line arguments or environment variables.
+
+### Command-Line Arguments
+
+| Argument       | Default        | Description                                                        |
+| :------------- | :------------- | :----------------------------------------------------------------- |
+| `--hotkey`     | `option+space` | The hotkey combination (e.g., `cmd+shift+d`, `ctrl+opt+space`).    |
+| `--mode`       | `push-to-talk` | `push-to-talk` (hold to record) or `toggle` (press to start/stop). |
+| `--low-memory` | `False`        | Enables auto-unloading of the model after 5 minutes of inactivity. |
+
+### Environment Variables
+
+| Variable     | Default                              | Description                                             |
+| :----------- | :----------------------------------- | :------------------------------------------------------ |
+| `MODEL_NAME` | `mlx-community/parakeet-tdt-0.6b-v3` | The Hugging Face ID of the MLX-compatible model to use. |
+
+### Example Usage
+
+To use "toggle" mode with a custom hotkey:
 
 ```bash
-python main.py --mode toggle --hotkey "cmd+shift+d"
+python main.py --mode toggle --hotkey "cmd+shift+d" --low-memory
 ```
 
 ## Uninstallation
@@ -70,3 +88,9 @@ To remove the login item and the compiled app, run:
 ```bash
 ./destroy.sh
 ```
+
+## Version Log
+
+- **v1.2.0** – Low-memory mode: Automatic model unloading after 5 minutes of inactivity.
+- **v1.1.0** – Memory optimizations: Transcription cache clearing and resource cleanup.
+- **v1.0.0** – Initial release: Local ASR using Parakeet-TDT with system-wide hotkeys.

@@ -1,4 +1,5 @@
 import argparse
+import gc
 import sys
 import threading
 import queue
@@ -103,27 +104,48 @@ def parse_hotkey(hotkey_str: str) -> tuple[int, int]:
 # ── Dictation app ──────────────────────────────────────────────────────
 
 class DictationApp:
-    def __init__(self, modifier_mask: int, keycode: int, mode: str) -> None:
+    UNLOAD_TIMEOUT_SECONDS = 300  # 5 minutes
+
+    def __init__(self, modifier_mask: int, keycode: int, mode: str, low_memory: bool = False) -> None:
         self.modifier_mask = modifier_mask
         self.keycode = keycode
         self.mode = mode
+        self.low_memory = low_memory
 
-        self.is_recording = False
+        self.is_recording = threading.Event()
         self.hotkey_held = False
         self.audio_queue: queue.Queue[np.ndarray] = queue.Queue()
         self.sample_rate = 16000
         self.stream: sd.InputStream | None = None
         self.keyboard = KeyboardController()
 
-        self.transcription_lock = threading.Lock()
+        self._timer_lock = threading.Lock()
+        self._unload_timer: threading.Timer | None = None
+        self._unload_token = 0
         
         self.mic_task_queue: queue.Queue = queue.Queue()
         threading.Thread(target=self._mic_worker, daemon=True).start()
 
-        model_name = os.environ.get("MODEL_NAME", "mlx-community/parakeet-tdt-0.6b-v3")
-        logging.info(f"Loading transcription model '{model_name}' (this may take a few seconds)...")
-        self.model = parakeet_mlx.from_pretrained(model_name)
-        logging.info("Model loaded successfully!")
+        self.model_task_queue: queue.Queue = queue.Queue()
+        threading.Thread(target=self._model_worker, daemon=True).start()
+
+        self.model_name = os.environ.get("MODEL_NAME", "mlx-community/parakeet-tdt-0.6b-v3")
+        self.model = None
+        self._load_model()
+        self._reset_unload_timer()
+
+    # –– Background workers –––––––––––––––––––––––––––––––––––––––––––––
+
+    def _model_worker(self) -> None:
+        """Background thread executing all MLX model operations sequentially."""
+        while True:
+            task = self.model_task_queue.get()
+            try:
+                task()
+            except Exception as e:
+                logging.error(f"Model worker failed: {e}")
+            finally:
+                self.model_task_queue.task_done()
 
     def _mic_worker(self) -> None:
         """Background thread executing microphone start/stop safely off the UI thread."""
@@ -136,19 +158,71 @@ class DictationApp:
             finally:
                 self.mic_task_queue.task_done()
 
+    # ── Model lifecycle ────────────────────────────────────────────────
+
+    def _load_model(self) -> None:
+        """Load the transcription model into memory (no-op if already loaded)."""
+        if self.model is not None:
+            return
+        logging.info(f"Loading transcription model '{self.model_name}' (this may take a few seconds)...")
+        self.model = parakeet_mlx.from_pretrained(self.model_name)
+        logging.info("Model loaded successfully!")
+
+    def _unload_model(self, token: int) -> None:
+        """Unload the model from memory to free resources."""
+        with self._timer_lock:
+            if token != self._unload_token:
+                return
+
+        if self.model is None:
+            return
+        logging.info("Unloading model due to inactivity...")
+        self.model = None
+        gc.collect()
+        mx.clear_cache()
+        logging.info("Model unloaded. A cold start will be required on next dictation.")
+
+    def _time_unload(self, token: int) -> None:
+        self.model_task_queue.put(lambda: self._unload_model(token))
+
+    def _reset_unload_timer(self) -> None:
+        """(Re)start the inactivity timer that unloads the model. Only active in low-memory mode."""
+        if not self.low_memory:
+            return
+        with self._timer_lock:
+            if self._unload_timer is not None:
+                self._unload_timer.cancel()
+            self._unload_token += 1
+            token = self._unload_token
+            # Use _time_unload to push the unload task to the model queue
+            self._unload_timer = threading.Timer(self.UNLOAD_TIMEOUT_SECONDS, self._time_unload, args=(token,))
+            self._unload_timer.daemon = True
+            self._unload_timer.start()
+
     # ── Audio ──────────────────────────────────────────────────────────
 
     def _audio_callback(self, indata: np.ndarray, frames, time_info, status) -> None:
         if status:
             logging.warning(f"Audio status: {status}")
-        if self.is_recording:
+        if self.is_recording.is_set():
             self.audio_queue.put(indata.copy().flatten())
 
     def start_recording(self) -> None:
-        if self.is_recording:
+        if self.is_recording.is_set():
             return
         logging.info("🎙  Recording...")
-        self.is_recording = True
+
+        # Cancel the inactivity timer while the user is actively recording
+        with self._timer_lock:
+            if self._unload_timer is not None:
+                self._unload_timer.cancel()
+                self._unload_timer = None
+            # Increment the token to invalidate any already-queued unloads
+            self._unload_token += 1
+
+        # Preload model in background so it's ready by the time the user stops speaking
+        self.model_task_queue.put(self._load_model)
+        self.is_recording.set()
 
         while not self.audio_queue.empty():
             self.audio_queue.get()
@@ -159,22 +233,22 @@ class DictationApp:
             )
             self.stream.start()
         except Exception as e:
-            self.is_recording = False
+            self.is_recording.clear()
             logging.error(f"Failed to start hardware microphone stream: {e}")
             raise  # Let the worker thread log it normally
 
     def toggle_recording(self) -> None:
         """Helper to synchronously toggle state on the mic worker thread."""
-        if self.is_recording:
+        if self.is_recording.is_set():
             self.stop_recording()
         else:
             self.start_recording()
 
     def stop_recording(self) -> None:
-        if not self.is_recording:
+        if not self.is_recording.is_set():
             return
         logging.info("⏹  Stopped recording.")
-        self.is_recording = False
+        self.is_recording.clear()
 
         if self.stream is not None:
             self.stream.stop()
@@ -204,7 +278,7 @@ class DictationApp:
         thread_started = False
         try:
             sf.write(wav_path, audio, self.sample_rate)
-            threading.Thread(target=self._transcribe_and_type, args=(wav_path,), daemon=True).start()
+            self.model_task_queue.put(lambda p=wav_path: self._transcribe_and_type(p))
             thread_started = True
         except Exception as e:
             logging.error(f"Failed to write audio to file: {e}")
@@ -219,31 +293,34 @@ class DictationApp:
 
     def _transcribe_and_type(self, wav_path: str) -> None:
         logging.info("Transcribing...")
-        with self.transcription_lock:
+        try:
+            self._load_model()  # no-op if already loaded; cold start if unloaded
+            result = self.model.transcribe(wav_path)
+            text = (result.text if hasattr(result, 'text') else str(result)).strip()
+            logging.info(f"Result: '{text}'")
+            if text:
+                self.keyboard.type(text + ' ')
+        except Exception as e:
+            logging.error(f"Transcription failed: {e}")
+        finally:
+            if 'result' in locals():
+                del result
+            if 'text' in locals():
+                del text
+
+            gc.collect()
             try:
-                result = self.model.transcribe(wav_path)
-                text = (result.text if hasattr(result, 'text') else str(result)).strip()
-                logging.info(f"Result: '{text}'")
-                if text:
-                    self.keyboard.type(text + ' ')
+                mx.clear_cache()
             except Exception as e:
-                logging.error(f"Transcription failed: {e}")
-            finally:
-                if 'result' in locals():
-                    del result
-                if 'text' in locals():
-                    del text
+                logging.error(f"Failed to clear MLX cache: {e}")
 
+            if os.path.exists(wav_path):
                 try:
-                    mx.clear_cache()
+                    os.remove(wav_path)
                 except Exception as e:
-                    logging.error(f"Failed to clear MLX cache: {e}")
+                    logging.warning(f"Failed to delete temp file {wav_path}: {e}")
 
-                if os.path.exists(wav_path):
-                    try:
-                        os.remove(wav_path)
-                    except Exception as e:
-                        logging.warning(f"Failed to delete temp file {wav_path}: {e}")
+            self._reset_unload_timer()
 
     # ── CGEventTap callback ────────────────────────────────────────────
 
@@ -263,7 +340,8 @@ class DictationApp:
             return None
 
         flags = CGEventGetFlags(event)
-        if (flags & self.modifier_mask) != self.modifier_mask:
+        primary_mask = kCGEventFlagMaskShift | kCGEventFlagMaskControl | kCGEventFlagMaskAlternate | kCGEventFlagMaskCommand
+        if (flags & primary_mask) != self.modifier_mask:
             return event
 
         if event_type == kCGEventKeyDown and not self.hotkey_held:
@@ -327,6 +405,12 @@ def main() -> None:
         default="push-to-talk",
         help="'push-to-talk' (hold to record) or 'toggle' (press to start/stop). Default: push-to-talk",
     )
+    parser.add_argument(
+        "--low-memory",
+        action="store_true",
+        default=False,
+        help="Enable low-memory mode: unload the model after 5 minutes of inactivity (cold start on next use).",
+    )
     args = parser.parse_args()
 
     try:
@@ -336,7 +420,7 @@ def main() -> None:
         logging.error(f"Invalid hotkey configuration: {e}")
         sys.exit(1)
 
-    app = DictationApp(modifier_mask, keycode, args.mode)
+    app = DictationApp(modifier_mask, keycode, args.mode, low_memory=args.low_memory)
     app.run()
 
 
