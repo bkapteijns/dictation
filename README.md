@@ -91,6 +91,7 @@ To remove the login item and the compiled app, run:
 
 ## Version Log
 
+- **v1.2.1** – Fixed issue where model caused delay in starting recording.
 - **v1.2.0** – Low-memory mode: Automatic model unloading after 5 minutes of inactivity.
 - **v1.1.0** – Memory optimizations: Transcription cache clearing and resource cleanup.
 - **v1.0.0** – Initial release: Local ASR using Parakeet-TDT with system-wide hotkeys.

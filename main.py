@@ -220,8 +220,6 @@ class DictationApp:
             # Increment the token to invalidate any already-queued unloads
             self._unload_token += 1
 
-        # Preload model in background so it's ready by the time the user stops speaking
-        self.model_task_queue.put(self._load_model)
         self.is_recording.set()
 
         while not self.audio_queue.empty():
@@ -236,6 +234,9 @@ class DictationApp:
             self.is_recording.clear()
             logging.error(f"Failed to start hardware microphone stream: {e}")
             raise  # Let the worker thread log it normally
+
+        # Preload model in background so it's ready by the time the user stops speaking.
+        self.model_task_queue.put(self._load_model)
 
     def toggle_recording(self) -> None:
         """Helper to synchronously toggle state on the mic worker thread."""
